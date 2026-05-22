@@ -20,7 +20,7 @@ import cv2
 import numpy as np
 
 from .audio import estimate_rpm_from_audio
-from .detection import estimate_rpm, find_shot_frames
+from .detection import estimate_rpm, find_shot_frames, launch_sample_frames
 from .geometry import CameraGeometry
 from .roi_select import grab_first_content_frame
 from .tracking import TemplateTracker, TrackPoint
@@ -150,20 +150,25 @@ def analyse(cfg: AnalysisConfig) -> AnalysisResult:
     tag_xy = np.array([[p.x, p.y] for p in tag_pts])
     conf = np.array([p.confidence for p in tag_pts])
     aim_raw = -(tag_xy - tag_xy[0])  # aim = negative of feature displacement
-    t0 = shot_frames[0] if shot_frames else 0  # first shot = spatial + time origin
-    origin = aim_raw[t0]
+    # Sample each bullet at the trigger-pull aim (settled frame before its kick),
+    # not the ammo-counter frame; matters for violent-kick weapons (revolvers).
+    sample_frames = launch_sample_frames(aim_raw, shot_frames)
+    t0 = shot_frames[0] if shot_frames else 0  # time origin = first actual shot
+    pos0 = sample_frames[0] if shot_frames else 0  # spatial origin = first launch
+    origin = aim_raw[pos0]
     aim = aim_raw - origin
 
     # ---- per-bullet pattern ---------------------------------------------
     pattern = []
-    for k, f in enumerate(shot_frames, start=1):
-        px, py = float(aim[f, 0]), float(aim[f, 1])
+    for k, (f, sf) in enumerate(zip(shot_frames, sample_frames), start=1):
+        px, py = float(aim[sf, 0]), float(aim[sf, 1])
         dx_deg, dy_deg = geom.px_to_deg(px, py)
         dx_cm, dy_cm = geom.px_to_cm(px, py)
         pattern.append(
             {
                 "bullet": k,
                 "frame": int(f),
+                "sample_frame": int(sf),
                 "time_s": round((f - t0) / fps, 5),
                 "x": round(px, 3),
                 "y": round(py, 3),
@@ -171,7 +176,7 @@ def analyse(cfg: AnalysisConfig) -> AnalysisResult:
                 "dy_deg": round(dy_deg, 4),
                 "dx_cm": round(dx_cm, 4),
                 "dy_cm": round(dy_cm, 4),
-                "confidence": round(float(conf[f]), 4),
+                "confidence": round(float(conf[sf]), 4),
             }
         )
 
@@ -191,8 +196,8 @@ def analyse(cfg: AnalysisConfig) -> AnalysisResult:
     if box_pts and shot_frames:
         box_xy = np.array([[p.x, p.y] for p in box_pts])
         box_aim = -(box_xy - box_xy[0])
-        box_aim -= box_aim[shot_frames[0]]
-        diffs = np.linalg.norm(aim[shot_frames] - box_aim[shot_frames], axis=1)
+        box_aim -= box_aim[pos0]
+        diffs = np.linalg.norm(aim[sample_frames] - box_aim[sample_frames], axis=1)
         box_check = {
             "feature": "box",
             "mean_abs_diff_px": round(float(np.mean(diffs)), 3),

@@ -87,6 +87,44 @@ def find_shot_frames(
     return peaks
 
 
+def launch_sample_frames(
+    aim: np.ndarray,
+    shot_frames: list[int],
+    kick_frac: float = 0.15,
+) -> list[int]:
+    """Pick the frame whose aim to sample for each shot (the trigger-pull aim).
+
+    A shot is normally sampled at its detected (ammo-counter) frame. But a
+    weapon with a violent kick - a revolver, say - has already thrown the view
+    far from the aim point by the time the counter ticks, so sampling there
+    records a point partway up the kick, and frame-timing jitter scatters it
+    differently each shot. When the view is moving fast *at* the shot frame
+    (per-frame speed exceeds ``kick_frac`` of the clip's recoil range) we walk
+    back to the last settled frame before the kick onset - where the trigger was
+    actually pulled. Continuously firing weapons (full-auto) climb only a tiny
+    fraction of the range per frame, so they never trip the threshold and are
+    returned unchanged.
+    """
+    if not shot_frames or len(aim) < 2:
+        return list(shot_frames)
+
+    speed = np.zeros(len(aim))
+    speed[1:] = np.linalg.norm(np.diff(aim, axis=0), axis=1)
+    scale = max(float(np.ptp(aim[:, 0])), float(np.ptp(aim[:, 1])))
+    kick_thr = kick_frac * scale
+    if kick_thr <= 0:
+        return list(shot_frames)
+
+    out: list[int] = []
+    for k, f in enumerate(shot_frames):
+        lo = shot_frames[k - 1] + 1 if k > 0 else 0  # never cross the prior shot
+        i = f
+        while i > lo and speed[i] > kick_thr:
+            i -= 1
+        out.append(i)
+    return out
+
+
 @dataclass
 class RpmEstimate:
     rpm: float | None  # from total span (least quantization error)
