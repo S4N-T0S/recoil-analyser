@@ -122,7 +122,7 @@ def main(argv: list[str] | None = None) -> int:
     d = result.data
     print(
         f"\nDone: {d['shots_detected']} shots, "
-        f"RPM~{d['rpm']['video_span']}, "
+        f"RPM~{d['rpm']['video_span']} (mech. max ~{d['rpm']['mechanical_max']}), "
         f"min tracking confidence {d['tracking']['min_confidence']:.3f}"
     )
     return 0

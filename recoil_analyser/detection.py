@@ -91,36 +91,68 @@ def find_shot_frames(
 class RpmEstimate:
     rpm: float | None  # from total span (least quantization error)
     rpm_median: float | None  # from median inter-shot interval
+    rpm_max: float | None  # mechanical max: from the tightest cluster of shortest intervals
     n_shots: int
     intervals_frames: list[int] = field(default_factory=list)
     mean_interval_frames: float | None = None
     std_interval_frames: float | None = None
+    mechanical_interval_frames: float | None = None
+    n_intervals_used: int | None = None  # intervals that fed rpm_max
+
+
+# An interval counts as the weapon's mechanical cadence (not a human-controlled
+# pause between bursts/clicks) if it is within this factor of the fastest
+# observed cadence. Burst-internal / capped-semi gaps cluster tightly near the
+# floor; the human pauses between them are far larger, so 1.4x cleanly separates
+# them while still tolerating +/-1 frame quantization at 120 fps.
+_CADENCE_TOL = 1.4
 
 
 def estimate_rpm(shot_frames: list[int], fps: float) -> RpmEstimate:
     """Estimate rate of fire (rounds/min) from shot frame indices.
 
+    Three figures are reported because they answer different questions:
+
+    * ``rpm`` (span) and ``rpm_median`` assume a *constant* fire rate across the
+      whole magazine. They are correct for full-auto but misleading for burst or
+      mashed-semi fire, where long human-controlled gaps sit between shots.
+    * ``rpm_max`` is the weapon's mechanical ceiling: the rate implied by the
+      tightest cluster of *shortest* intervals. The gun cannot fire faster than
+      this regardless of input, so within-burst shots (or a mashed semi hitting
+      its cap) all land at this cadence while human pauses are discarded. For
+      full-auto every interval is in the cluster, so it collapses to ``rpm``.
+
     The span form ``60 * fps * (n-1) / (last - first)`` spreads the +/-1 frame
-    quantization error of a 120 fps capture across the whole burst, so it is far
-    more accurate than averaging individual intervals.
+    quantization error of a 120 fps capture across the whole burst.
     """
     n = len(shot_frames)
     if n < 2:
-        return RpmEstimate(rpm=None, rpm_median=None, n_shots=n)
+        return RpmEstimate(rpm=None, rpm_median=None, rpm_max=None, n_shots=n)
 
     frames = sorted(shot_frames)
     span = frames[-1] - frames[0]
     rpm_span = 60.0 * fps * (n - 1) / span if span > 0 else None
 
     intervals = [frames[i + 1] - frames[i] for i in range(n - 1)]
-    median_int = float(np.median(intervals))
+    arr = np.asarray(intervals, dtype=np.float64)
+    median_int = float(np.median(arr))
     rpm_median = 60.0 * fps / median_int if median_int > 0 else None
+
+    # Mechanical cadence: reference the low end robustly (10th pct shrugs off a
+    # single spuriously short interval), then average the cluster within tol.
+    ref = float(np.percentile(arr, 10)) if arr.size >= 5 else float(arr.min())
+    cluster = arr[arr <= ref * _CADENCE_TOL]
+    mech_int = float(np.mean(cluster)) if cluster.size else None
+    rpm_max = 60.0 * fps / mech_int if mech_int and mech_int > 0 else None
 
     return RpmEstimate(
         rpm=rpm_span,
         rpm_median=rpm_median,
+        rpm_max=rpm_max,
         n_shots=n,
         intervals_frames=intervals,
-        mean_interval_frames=float(np.mean(intervals)),
-        std_interval_frames=float(np.std(intervals)),
+        mean_interval_frames=float(np.mean(arr)),
+        std_interval_frames=float(np.std(arr)),
+        mechanical_interval_frames=round(mech_int, 3) if mech_int else None,
+        n_intervals_used=int(cluster.size) if cluster.size else None,
     )

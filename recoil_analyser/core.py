@@ -150,7 +150,8 @@ def analyse(cfg: AnalysisConfig) -> AnalysisResult:
     tag_xy = np.array([[p.x, p.y] for p in tag_pts])
     conf = np.array([p.confidence for p in tag_pts])
     aim_raw = -(tag_xy - tag_xy[0])  # aim = negative of feature displacement
-    origin = aim_raw[shot_frames[0]] if shot_frames else aim_raw[0]
+    t0 = shot_frames[0] if shot_frames else 0  # first shot = spatial + time origin
+    origin = aim_raw[t0]
     aim = aim_raw - origin
 
     # ---- per-bullet pattern ---------------------------------------------
@@ -163,7 +164,7 @@ def analyse(cfg: AnalysisConfig) -> AnalysisResult:
             {
                 "bullet": k,
                 "frame": int(f),
-                "time_s": round(f / fps, 5),
+                "time_s": round((f - t0) / fps, 5),
                 "x": round(px, 3),
                 "y": round(py, 3),
                 "dx_deg": round(dx_deg, 4),
@@ -177,7 +178,7 @@ def analyse(cfg: AnalysisConfig) -> AnalysisResult:
     trajectory = [
         {
             "frame": i,
-            "time_s": round(i / fps, 5),
+            "time_s": round((i - t0) / fps, 5),
             "x": round(float(aim[i, 0]), 3),
             "y": round(float(aim[i, 1]), 3),
             "confidence": round(float(conf[i]), 4),
@@ -221,6 +222,9 @@ def analyse(cfg: AnalysisConfig) -> AnalysisResult:
         "rpm": {
             "video_span": round(rpm.rpm, 1) if rpm.rpm is not None else None,
             "video_median": round(rpm.rpm_median, 1) if rpm.rpm_median is not None else None,
+            "mechanical_max": round(rpm.rpm_max, 1) if rpm.rpm_max is not None else None,
+            "mechanical_interval_frames": rpm.mechanical_interval_frames,
+            "n_intervals_used": rpm.n_intervals_used,
             "audio": round(audio_rpm, 1) if audio_rpm is not None else None,
             "mean_interval_frames": round(rpm.mean_interval_frames, 2)
             if rpm.mean_interval_frames is not None
@@ -239,7 +243,9 @@ def analyse(cfg: AnalysisConfig) -> AnalysisResult:
         },
         "coordinate_convention": (
             "Screen pixels: +x right, +y down. Recoil up/right => aim moves "
-            "up/right => negative y / positive x. Pattern is relative to bullet 1."
+            "up/right => negative y / positive x. Pattern is relative to bullet 1. "
+            "time_s is relative to the first shot (bullet 1 = 0.0; pre-shot frames "
+            "are negative). 'frame' remains the absolute index into the video file."
         ),
         "rois": {
             "tag": list(cfg.tag_roi),

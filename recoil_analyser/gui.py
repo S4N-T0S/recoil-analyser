@@ -280,6 +280,7 @@ class RecoilGui:
             f"Shots detected: {d['shots_detected']} (magazine {d['magazine']})\n"
             f"RPM (video span): {rpm['video_span']}\n"
             f"RPM (median):     {rpm['video_median']}\n"
+            f"RPM (mech. max):  {rpm['mechanical_max']}\n"
             f"RPM (audio):      {rpm['audio']}\n"
             f"Tracking confidence min/mean: "
             f"{d['tracking']['min_confidence']:.3f} / {d['tracking']['mean_confidence']:.3f}\n\n"
