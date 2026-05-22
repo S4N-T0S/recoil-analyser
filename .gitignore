@@ -39,12 +39,13 @@ ENV/
 .DS_Store
 Thumbs.db
 
-# Project-specific: raw footage goes here, never commit large video files
+# Project-specific
 data/*.mp4
 data/*.avi
 data/*.mov
 data/*.mkv
 data/*.webm
+!data/AKM.mp4
 
 # Output exports (generated, not source — keep the folder, ignore contents)
 output/*
