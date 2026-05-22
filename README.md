@@ -66,10 +66,7 @@ clip should look and be cut. Please do not compress your analysis clips.
 
 ![How to draw the tag / ammo / box ROIs](docs/roi_guide.png)
 
-<video src="https://github.com/S4N-T0S/recoil-analyser/raw/main/data/AKM.mp4" controls width="640">
-  Your browser can't play this embed —
-  <a href="https://github.com/S4N-T0S/recoil-analyser/raw/main/data/AKM.mp4">example clip</a>.
-</video>
+https://github.com/user-attachments/assets/74446ccb-1aac-4eb2-8659-dffad226b1d3
 
 ---
 
