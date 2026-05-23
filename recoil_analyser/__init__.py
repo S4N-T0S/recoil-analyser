@@ -5,7 +5,7 @@ adjusting FOV / distance / magazine / ROIs. See README.md for the recording
 protocol and the analysis method.
 """
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 __author__ = "S4N-T0S"
 __url__ = "https://github.com/S4N-T0S/recoil-analyser"
 __website__ = "https://s4nt0s.eu"

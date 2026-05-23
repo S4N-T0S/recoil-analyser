@@ -191,6 +191,23 @@ def analyse(cfg: AnalysisConfig) -> AnalysisResult:
         for i in range(n_frames)
     ]
 
+    # ---- recoil classification ------------------------------------------
+    # The pre-kick sampler only moves the sample frames for a violent-kick weapon
+    # that fully recovers between shots (revolver-class). For these the pattern is
+    # effectively zero and ``spread_px`` is the residual measurement floor (a few
+    # px from firing before the view finishes recovering), NOT real recoil.
+    recovers = sample_frames != list(shot_frames)
+    if pattern:
+        xs = [p["x"] for p in pattern]
+        ys = [p["y"] for p in pattern]
+        spread_px = {
+            "x": round(max(xs) - min(xs), 3),
+            "y": round(max(ys) - min(ys), 3),
+            "max": round(max(max(xs) - min(xs), max(ys) - min(ys)), 3),
+        }
+    else:
+        spread_px = {"x": 0.0, "y": 0.0, "max": 0.0}
+
     # ---- box cross-check -------------------------------------------------
     box_check = None
     if box_pts and shot_frames:
@@ -224,6 +241,8 @@ def analyse(cfg: AnalysisConfig) -> AnalysisResult:
         "magazine": cfg.magazine,
         "shots_detected": len(shot_frames),
         "shot_method": cfg.shot_method,
+        "recoil_class": "recovers_between_shots" if recovers else "standard",
+        "pattern_spread_px": spread_px,
         "rpm": {
             "video_span": round(rpm.rpm, 1) if rpm.rpm is not None else None,
             "video_median": round(rpm.rpm_median, 1) if rpm.rpm_median is not None else None,

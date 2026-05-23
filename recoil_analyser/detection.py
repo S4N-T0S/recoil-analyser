@@ -90,38 +90,59 @@ def find_shot_frames(
 def launch_sample_frames(
     aim: np.ndarray,
     shot_frames: list[int],
-    kick_frac: float = 0.15,
+    rest_speed: float = 1.5,
+    max_lookback: int = 15,
+    min_kick_px: float = 10.0,
 ) -> list[int]:
     """Pick the frame whose aim to sample for each shot (the trigger-pull aim).
 
-    A shot is normally sampled at its detected (ammo-counter) frame. But a
-    weapon with a violent kick - a revolver, say - has already thrown the view
-    far from the aim point by the time the counter ticks, so sampling there
-    records a point partway up the kick, and frame-timing jitter scatters it
-    differently each shot. When the view is moving fast *at* the shot frame
-    (per-frame speed exceeds ``kick_frac`` of the clip's recoil range) we walk
-    back to the last settled frame before the kick onset - where the trigger was
-    actually pulled. Continuously firing weapons (full-auto) climb only a tiny
-    fraction of the range per frame, so they never trip the threshold and are
-    returned unchanged.
+    A bullet leaves the muzzle pointed wherever the crosshair sat *before* the
+    recoil kick moved the view - but the ammo-counter HUD (what we detect shots
+    from) only ticks once the round is gone, a variable 1-5 frames into the kick.
+    Sampling at the detected frame therefore records a point partway up the kick,
+    and frame-timing jitter scatters it differently each shot. This is invisible
+    on steady weapons (the view barely moves in one frame) but wrecks the pattern
+    of violent-kick weapons like revolvers, which the gun fully recovers from
+    between shots so every bullet truly lands in the same spot.
+
+    Fix: if the view is moving at the detected frame (per-frame speed above
+    ``rest_speed``), walk back up to ``max_lookback`` frames - but never past the
+    previous shot - to the last frame where it was *settled* (speed at/below
+    ``rest_speed``); that is where the trigger was pulled. If no settled frame is
+    found (continuous full-auto fire never comes to rest between shots), the
+    detected frame is kept. ``rest_speed`` sits well above the sub-pixel jitter
+    of a parked view yet far below a kick's onset (which starts at several
+    px/frame), so the two are cleanly separated.
+
+    The correction is applied all-or-nothing per weapon, gated on the typical
+    walk-back *distance*: only a violent kick that the gun fully recovers from
+    moves the view far enough that the ammo tick lands a big jump away from the
+    firing aim (revolver ~140px, BFR ~15px). Steadier weapons - including
+    full-auto, bursts, and ordinary semis (a DMR walks back <10px) - have the
+    detected frame at or near the firing aim already, so if the median walk-back
+    is below ``min_kick_px`` the clip is left unchanged at its detected frames.
     """
     if not shot_frames or len(aim) < 2:
         return list(shot_frames)
 
     speed = np.zeros(len(aim))
     speed[1:] = np.linalg.norm(np.diff(aim, axis=0), axis=1)
-    scale = max(float(np.ptp(aim[:, 0])), float(np.ptp(aim[:, 1])))
-    kick_thr = kick_frac * scale
-    if kick_thr <= 0:
-        return list(shot_frames)
 
     out: list[int] = []
     for k, f in enumerate(shot_frames):
-        lo = shot_frames[k - 1] + 1 if k > 0 else 0  # never cross the prior shot
+        if speed[f] <= rest_speed:  # already settled at the detected frame
+            out.append(f)
+            continue
+        lo = max(shot_frames[k - 1] + 1 if k > 0 else 0, f - max_lookback)
         i = f
-        while i > lo and speed[i] > kick_thr:
+        while i > lo and speed[i] > rest_speed:
             i -= 1
-        out.append(i)
+        out.append(i if speed[i] <= rest_speed else f)
+
+    if len(shot_frames) > 1:
+        moved = [float(np.linalg.norm(aim[f] - aim[s])) for f, s in zip(shot_frames, out)]
+        if float(np.median(moved)) <= min_kick_px:
+            return list(shot_frames)
     return out
 
 

@@ -130,7 +130,8 @@ Omit `--tag` / `--ammo` to be prompted to draw them. Useful flags:
 | **Tracking** | Sub-pixel template matching (normalised cross-correlation) of the frame-0 tag against every frame, refined by a parabolic fit on the correlation peak. Always matched against frame 0, so it never drifts. The gun model, weapon sway and FOV "punch" are ignored because we track the *wall*, not the gun. |
 | **Aim trajectory** | `aim = −(tag_position − tag_position_at_frame_0)`. Pure view rotation moves every world point by the same number of pixels, so the tag's screen motion equals the aim point's motion (negated). |
 | **Shot detection** | *ammo* (default): per-frame change inside the ammo-counter ROI spikes when a round is consumed; we keep the strongest `magazine` peaks. *muzzle*: brightness peaks in a muzzle ROI. |
-| **RPM** | `60 · fps · (n−1) / (last_shot_frame − first_shot_frame)` — the total-span form minimises 120 fps quantization error. Audio onset detection (via ffmpeg) provides an independent cross-check. |
+| **Trigger-pull sampling** | The ammo HUD ticks a variable 1–5 frames *after* the round leaves, so on a violent-kick weapon the detected frame is already partway up the kick. For weapons that fully recover between shots (revolvers), each bullet is therefore sampled at the last settled frame before its kick — where the trigger was actually pulled — instead of the detected frame. Continuous-fire weapons are sampled at the detected frame unchanged. `pattern[].sample_frame` reports which frame was used. |
+| **RPM** | `video_span` = `60 · fps · (n−1) / (last_shot_frame − first_shot_frame)` (total-span form minimises 120 fps quantization error) — correct for full-auto. `mechanical_max` derives the weapon's mechanical ceiling from the tightest cluster of *shortest* inter-shot intervals, so it recovers the true rate for **burst and semi-auto** weapons where the span/median average in human-controlled gaps. Audio onset detection (via ffmpeg) provides an independent cross-check. |
 | **Units** | Pinhole model: `focal_px = (axis_size/2) / tan(fov/2)` where `axis_size` is the height for a vertical FOV (The Finals' default) or width for horizontal; degrees `= atan(Δpx / focal_px)`; cm on wall `= distance · Δpx / focal_px`. |
 
 ### Coordinate convention
@@ -138,6 +139,8 @@ Omit `--tag` / `--ammo` to be prompted to draw them. Useful flags:
 Screen pixels, **+x = right, +y = down**. A normal upward kick therefore shows
 as **negative y**. The per-bullet `pattern` is relative to bullet 1 (so
 bullet 1 = `0, 0`); the full per-frame `trajectory` is included for animation.
+`time_s` is relative to the first shot (bullet 1 = `0.0`; frames before it are
+negative), while `frame` stays the absolute index into the video file.
 
 ---
 
@@ -151,17 +154,20 @@ bullet 1 = `0, 0`); the full per-frame `trajectory` is included for animation.
                "distance_m": 13, "focal_px": 842.6 },
   "magazine": 34,
   "shots_detected": 34,
-  "rpm": { "video_span": 720.0, "video_median": 720.0, "audio": 718.4,
-           "intervals_frames": [10, 10, ...] },
+  "recoil_class": "standard",        // or "recovers_between_shots" (revolver-class)
+  "pattern_spread_px": { "x": 41.1, "y": 245.6, "max": 245.6 },
+  "rpm": { "video_span": 720.0, "video_median": 720.0,
+           "mechanical_max": 720.0,      // weapon's ceiling (matters for burst/semi)
+           "audio": 718.4, "intervals_frames": [10, 10, ...] },
   "tracking": { "feature": "tag", "min_confidence": 0.97,
                 "box_crosscheck": { "mean_abs_diff_px": 0.4 } },
   "pattern": [                       // one entry per bullet, relative to bullet 1
-    { "bullet": 1, "frame": 1,  "time_s": 0.008, "x": 0.0,  "y": 0.0,
+    { "bullet": 1, "frame": 1,  "sample_frame": 1,  "time_s": 0.0, "x": 0.0,  "y": 0.0,
       "dx_deg": 0.0,  "dy_deg": 0.0,  "dx_cm": 0.0,  "dy_cm": 0.0 },
-    { "bullet": 2, "frame": 11, "time_s": 0.092, "x": -4.9, "y": -19.8,
+    { "bullet": 2, "frame": 11, "sample_frame": 11, "time_s": 0.083, "x": -4.9, "y": -19.8,
       "dx_deg": -0.19, "dy_deg": -0.76, "dx_cm": -4.3, "dy_cm": -17.2 }
   ],
-  "trajectory": [ { "frame": 0, "time_s": 0.0, "x": 0.0, "y": 0.0,
+  "trajectory": [ { "frame": 0, "time_s": -0.008, "x": 0.0, "y": 0.0,
                     "confidence": 1.0 }, ... ]   // per-frame view path
 }
 ```
@@ -171,6 +177,28 @@ was tracked cleanly. If it drops (e.g. the tag left frame or motion blur), the
 affected bullets are suspect. The `box_crosscheck` compares the recoil derived
 from the box against the tag; a large difference points to parallax/translation
 or a tracking failure.
+
+`recoil_class` is `"recovers_between_shots"` when the weapon fully recovers to
+the same aim between shots (revolver-class). For these the pattern is
+effectively zero and `pattern_spread_px.max` is the residual measurement floor
+(see *Known limitations*), not real recoil — a consumer can label them
+"≈ no recoil (±N px)". Everything else is `"standard"`.
+
+---
+
+## Known limitations
+
+**Violent-recoil weapons that fire before fully recovering (~±5 px floor).**
+Revolver-class weapons have no real recoil — every bullet lands in the same
+spot — and the analyser confirms this to within a few px (`recoil_class:
+"recovers_between_shots"`). The residual depends on fire rate: the slow BFR TITAN
+(~70 RPM) fully settles between shots and reads ~1 px, while a faster revolver
+(~140 RPM) fires while the view is still creeping through the last few px of
+recovery and reads ~4 px of phantom drift. This is *rendered-view lag*, not
+recoil: the game points the bullet at the true crosshair while the wall-view we
+track hasn't finished settling. The same few-px uncertainty exists on automatic
+weapons but is negligible against their 100–500 px patterns. Treat
+`pattern_spread_px` on a `recovers_between_shots` weapon as a noise floor.
 
 ---
 
