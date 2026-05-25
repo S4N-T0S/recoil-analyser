@@ -2,6 +2,21 @@
 
 Developer utilities — not needed for normal analysis.
 
+## pick_roi.py
+
+Interactive ROI picker. Used to find exact pixel bounding boxes (Regions of Interest) for a given video clip to feed into the headless CLI or debugging.
+
+The CLI takes ROIs as `X Y W H` pixel boxes (e.g., `--ammo 2348 1178 125 67`). This tool opens a scaled copy of the clip's first frame and lets you draw a box around each requested feature. It then prints the matching command-line flags so you can copy them straight into an analysis command. 
+
+*Note: ROI framing matters. You don't want something too tight.*
+
+```bash
+# run from the repo root
+uv run python tools/pick_roi.py data/AKM.mp4                     # picks tag + ammo (default)
+uv run python tools/pick_roi.py data/AKM.mp4 ammo                # just the ammo box
+uv run python tools/pick_roi.py data/AKM.mp4 tag ammo muzzle box # pick several
+```
+
 ## validate.py
 
 End-to-end accuracy test. It renders a 90-frame synthetic clip at 1280×720 with

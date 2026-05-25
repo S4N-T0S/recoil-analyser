@@ -14,16 +14,25 @@ displacement equals the negative of the tracked tag displacement.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 import cv2
 import numpy as np
 
 from .audio import estimate_rpm_from_audio
-from .detection import estimate_rpm, find_shot_frames, launch_sample_frames
+from .detection import (
+    estimate_rpm,
+    find_shot_frames,
+    flag_problem_frames,
+    launch_sample_frames,
+    shot_frames_from_readings,
+)
 from .geometry import CameraGeometry
 from .roi_select import grab_first_content_frame
 from .tracking import TemplateTracker, TrackPoint
+
+if TYPE_CHECKING:
+    from .ocr import OcrSeries
 
 ROI = tuple[int, int, int, int]  # x, y, w, h
 
@@ -34,7 +43,7 @@ class AnalysisConfig:
     tag_roi: ROI
     weapon: str = "Unknown"
     magazine: int | None = None
-    shot_method: str = "ammo"  # "ammo" | "muzzle"
+    shot_method: str = "ocr"  # "ocr" (default) | "ammo" | "muzzle"
     ammo_roi: ROI | None = None
     muzzle_roi: ROI | None = None
     box_roi: ROI | None = None
@@ -44,6 +53,10 @@ class AnalysisConfig:
     search_margin: int | None = 220
     use_audio: bool = True
     progress: Callable[[int, int], None] | None = None
+    # Optional human-in-the-loop OCR review (ocr method only). Called with the
+    # flagged problem frames, the per-frame colour crops, the OCR readings and
+    # the raw recognised texts; returns {frame_index: corrected_count_or_None}.
+    review: Callable[[list[int], list, list, list], dict] | None = None
 
 
 @dataclass
@@ -54,6 +67,7 @@ class AnalysisResult:
     box_track: list[TrackPoint] = field(default_factory=list)
     aim_xy: np.ndarray | None = None  # (n_frames, 2), origin = first shot
     shot_frames: list[int] = field(default_factory=list)
+    ocr_series: OcrSeries | None = None  # per-frame OCR readings (ocr method only)
 
 
 def _crop(frame: np.ndarray, roi: ROI) -> np.ndarray:
@@ -76,8 +90,8 @@ def analyse(cfg: AnalysisConfig) -> AnalysisResult:
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     n_frames_hint = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
 
-    if cfg.shot_method == "ammo" and cfg.ammo_roi is None:
-        raise ValueError("shot_method='ammo' requires ammo_roi")
+    if cfg.shot_method in ("ammo", "ocr") and cfg.ammo_roi is None:
+        raise ValueError(f"shot_method='{cfg.shot_method}' requires ammo_roi")
     if cfg.shot_method == "muzzle" and cfg.muzzle_roi is None:
         raise ValueError("shot_method='muzzle' requires muzzle_roi")
 
@@ -100,21 +114,26 @@ def analyse(cfg: AnalysisConfig) -> AnalysisResult:
         box_template = _crop(gray0, cfg.box_roi).copy()
         box_tracker = TemplateTracker(box_template, _roi_center(cfg.box_roi), cfg.search_margin)
 
+    is_ocr = cfg.shot_method == "ocr"
     prev_ammo = _crop(gray0, cfg.ammo_roi).astype(np.float32) if cfg.ammo_roi else None
 
     tag_pts: list[TrackPoint] = []
     box_pts: list[TrackPoint] = []
     ammo_diff: list[float] = []
     muzzle_bright: list[float] = []
+    ammo_crops: list[np.ndarray] = []  # colour crops fed to OCR (ocr method only)
 
     idx = 0
     gray = gray0
+    frame_color = frame0
     while True:
         tag_pts.append(tag_tracker.track(gray, idx))
         if box_tracker is not None:
             box_pts.append(box_tracker.track(gray, idx))
 
-        if cfg.ammo_roi is not None:
+        if is_ocr:
+            ammo_crops.append(_crop(frame_color, cfg.ammo_roi).copy())
+        elif cfg.ammo_roi is not None:
             cur = _crop(gray, cfg.ammo_roi).astype(np.float32)
             ammo_diff.append(float(np.mean(np.abs(cur - prev_ammo))) if prev_ammo is not None else 0.0)
             prev_ammo = cur
@@ -128,17 +147,54 @@ def analyse(cfg: AnalysisConfig) -> AnalysisResult:
         if not ok:
             break
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        frame_color = frame
         idx += 1
 
     cap.release()
     n_frames = len(tag_pts)
 
     # ---- shot detection --------------------------------------------------
-    if cfg.shot_method == "ammo":
-        signal = np.asarray(ammo_diff)
+    ocr_info = None
+    ocr_series = None
+    if is_ocr:
+        # OCR reads the count each frame; shots are reconstructed from the
+        # countdown rather than peak-picked from a 1-D signal.
+        from .ocr import AmmoReader
+
+        reader = AmmoReader()
+        series = reader.read_series(ammo_crops, magazine=cfg.magazine, progress=cfg.progress)
+        ocr_series = series
+        # Confidence over the frames we actually used (a readable count), scored
+        # from the raw OCR pass before any manual correction.
+        used_scores = [s for r, s in zip(series.readings, series.scores) if r is not None]
+
+        # Optional human-in-the-loop review of every flagged problem frame.
+        reviewed = 0
+        if cfg.review is not None:
+            problems = flag_problem_frames(series.readings, magazine=cfg.magazine)
+            if problems:
+                corrections = cfg.review(problems, ammo_crops, list(series.readings), series.texts)
+                for f, val in (corrections or {}).items():
+                    if 0 <= f < len(series.readings):
+                        series.readings[f] = val
+                reviewed = len(corrections or {})
+
+        shot_frames = shot_frames_from_readings(series.readings, magazine=cfg.magazine)
+        ocr_info = {
+            "model": reader.model_name,
+            "frames_read": len(used_scores),
+            "frames_total": n_frames,
+            "min_score": round(min(used_scores), 4) if used_scores else None,
+            "mean_score": round(float(np.mean(used_scores)), 4) if used_scores else None,
+            "over_magazine_rejected": series.over_magazine,
+            "reviewed_frames": reviewed,  # frames the user manually corrected
+            # The clearest correctness check: a magazine-long countdown should
+            # yield exactly `magazine` shots. None when no magazine was given.
+            "shots_match_magazine": (len(shot_frames) == cfg.magazine) if cfg.magazine else None,
+        }
     else:
-        signal = np.asarray(muzzle_bright)
-    shot_frames = find_shot_frames(signal, n_expected=cfg.magazine, min_gap=3)
+        signal = np.asarray(ammo_diff if cfg.shot_method == "ammo" else muzzle_bright)
+        shot_frames = find_shot_frames(signal, n_expected=cfg.magazine, min_gap=3)
     rpm = estimate_rpm(shot_frames, fps)
 
     audio_rpm = None
@@ -265,6 +321,7 @@ def analyse(cfg: AnalysisConfig) -> AnalysisResult:
             "mean_confidence": round(float(conf.mean()), 4),
             "box_crosscheck": box_check,
         },
+        "ocr": ocr_info,
         "coordinate_convention": (
             "Screen pixels: +x right, +y down. Recoil up/right => aim moves "
             "up/right => negative y / positive x. Pattern is relative to bullet 1. "
@@ -287,4 +344,5 @@ def analyse(cfg: AnalysisConfig) -> AnalysisResult:
         box_track=box_pts,
         aim_xy=aim,
         shot_frames=shot_frames,
+        ocr_series=ocr_series,
     )

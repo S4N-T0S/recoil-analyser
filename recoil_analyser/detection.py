@@ -14,6 +14,7 @@ which makes detection robust to threshold choice.
 
 from __future__ import annotations
 
+import bisect
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -144,6 +145,146 @@ def launch_sample_frames(
         if float(np.median(moved)) <= min_kick_px:
             return list(shot_frames)
     return out
+
+
+def _reconstruct(
+    readings: list[int | None],
+    magazine: int | None = None,
+    min_run: int = 2,
+    max_skip: int = 1,
+) -> tuple[list[int], int, int | None]:
+    """Core countdown reconstruction; returns ``(shots, end_index, start_level)``.
+
+    ``end_index`` is where firing stopped - the reload frame if a quick reload
+    was detected, otherwise ``len(readings)``. Callers that inspect per-frame
+    readings (e.g. review flagging) should ignore frames at/after ``end_index``:
+    those belong to a freshly reloaded magazine, not the burst being analysed.
+    ``start_level`` is the count the countdown began at (review flagging rebuilds
+    the expected per-frame count from it).
+    """
+    n = len(readings)
+    shots: list[int] = []
+    level: int | None = None
+    start_level: int | None = None
+    last_level_frame = -1  # most recent frame whose reading == level
+    end = n
+    i = 0
+    while i < n:
+        value = readings[i]
+        if value is None:
+            i += 1
+            continue
+        j = i
+        while j < n and readings[j] == value:
+            j += 1
+        if value == level:  # count unchanged - remember its latest frame
+            last_level_frame = j - 1
+            i = j
+            continue
+        if j - i < min_run:  # too brief to trust - treat as a blip, unless it's
+            # the opening full-magazine reading: the clip starts at a full mag and
+            # the first shot can land one frame later, so a 1-frame opening
+            # "18/18" is real. Trusted only when it equals the known magazine, so
+            # a 1-frame opening *misread* still can't set a bad start level.
+            if not (level is None and magazine is not None and value == magazine):
+                i += 1
+                continue
+        if level is None:
+            level = value
+            start_level = value
+            last_level_frame = j - 1
+        elif value < level:
+            drop = level - value
+            if drop <= max_skip:  # plausible: one round (or a tolerated skip)
+                # Time the shot to the frame the count *left* the old level
+                # (right after its last reading), not the frame the new value
+                # first reads cleanly. Back-dating across an intervening misread
+                # keeps the sampled aim off the recoil kick (else a 1-2 frame
+                # slip lands the bullet partway up the kick).
+                shots.extend([last_level_frame + 1] * drop)
+                level = value
+                last_level_frame = j - 1
+            # else: implausibly large drop -> digit-drop misread; hold `level`
+            #   and wait for the real level-1 rather than piling phantom shots.
+        elif magazine is not None and value >= magazine - max_skip and level <= magazine // 2:
+            # Quick reload: the count jumped back to (near) a full magazine from
+            # the back half of the mag, so it was emptied - some HUDs snap from
+            # "1" straight to "30" without ever showing "0". Register the rounds
+            # still showing when it emptied (level -> 0) as the final shots, then
+            # stop: anything after is a fresh magazine, out of scope.
+            if level > 0:
+                shots.extend([last_level_frame + 1] * level)
+            end = i
+            break
+        # else value > level (small increase): out-of-sequence misread -> ignore
+        i = j
+    return shots, end, start_level
+
+
+def shot_frames_from_readings(
+    readings: list[int | None],
+    magazine: int | None = None,
+    min_run: int = 2,
+    max_skip: int = 1,
+) -> list[int]:
+    """Reconstruct shot frames from a per-frame ammo-count series (OCR method).
+
+    The ammo HUD is a strict unit countdown that only redraws when a round is
+    fired, so each decrement between *stable* readings is one shot. The shot is
+    timed to the frame the count *left* the old value (right after its last
+    reading), not the frame the new value first reads cleanly - so a misread
+    frame sitting on the transition (e.g. a one-frame slash glitch) doesn't slip
+    the timing 1-2 frames late and sample the bullet partway up the kick. A
+    reading must still persist ``min_run`` consecutive frames to be trusted as a
+    new level, which discards single-frame OCR blips. Unreadable frames
+    (``None``) and spurious *higher* readings are ignored; the count only ever
+    goes down within a magazine.
+
+    **Pileup guard (``max_skip``).** At the capture's frame rate every count is
+    on screen for many frames (e.g. ~7 at 120 fps for a ~1000 RPM weapon), so a
+    stable reading that is more than ``max_skip`` *below* the current count can't
+    be genuine fire - it is a digit-drop misread, classically the two 1s of "11"
+    fusing into a single "1". Such a jump is ignored and the count is held until
+    the true ``level - 1`` is read, instead of attributing the whole apparent
+    drop (e.g. 12 -> 1 = eleven rounds) to one frame.
+
+    **Quick reload.** Some weapons (e.g. The Finals' ARN-220) empty the mag and
+    snap the HUD straight back to a full count without ever showing "0", so the
+    final shot's decrement is never displayed. When the count jumps back up to
+    (near) a full ``magazine`` from the back half of the mag, the remaining
+    rounds are registered as the last shots and reconstruction stops.
+    """
+    return _reconstruct(readings, magazine, min_run, max_skip)[0]
+
+
+def flag_problem_frames(
+    readings: list[int | None],
+    magazine: int | None = None,
+    min_run: int = 2,
+    max_skip: int = 1,
+) -> list[int]:
+    """Frame indices whose OCR reading is an 'issue' worth manual review.
+
+    A frame is flagged when its reading is unusable (``None`` - unreadable,
+    over-magazine or garbled) *or* disagrees with the reconstructed countdown
+    (a misread digit, e.g. "11" read as "1", or "5" while the count is really
+    6). Frames whose reading matches the countdown are never flagged, so a user
+    only ever confirms genuine problems - not the hundreds of correctly-read
+    frames. The reconstruction itself is robust to these misreads; review just
+    lets the user make the per-frame readings exact.
+    """
+    shots, end, start = _reconstruct(readings, magazine, min_run, max_skip)
+    problems: list[int] = []
+    for f in range(end):  # ignore frames after a reload (a fresh magazine)
+        r = readings[f]
+        if start is None:  # never got a stable reading - flag everything unread
+            if r is None:
+                problems.append(f)
+            continue
+        expected = start - bisect.bisect_right(shots, f)
+        if r is None or r != expected:
+            problems.append(f)
+    return problems
 
 
 @dataclass

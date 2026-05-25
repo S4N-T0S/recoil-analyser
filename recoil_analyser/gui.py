@@ -12,8 +12,13 @@ import webbrowser
 from pathlib import Path
 from tkinter import (
     BooleanVar,
+    Canvas,
+    Entry,
+    PhotoImage,
     StringVar,
+    Text,
     Tk,
+    Toplevel,
     filedialog,
     messagebox,
     ttk,
@@ -21,6 +26,7 @@ from tkinter import (
 
 from . import __author__, __website__
 from .core import AnalysisConfig, analyse
+from .deps import missing_ocr_dependencies, ocr_dependency_error_message
 from .export import save_json, save_plot
 from .roi_select import first_frame, select_roi_scaled
 
@@ -68,11 +74,12 @@ class RecoilGui:
         self.fov = StringVar(value="81")
         self.fov_axis = StringVar(value="vertical")
         self.distance = StringVar(value="13")
-        self.method = StringVar(value="ammo")
+        self.method = StringVar(value="ocr")
         self.outdir = StringVar(value=str(Path("output").resolve()))
         self.track_box = BooleanVar(value=False)
         self.use_audio = BooleanVar(value=True)
         self.show_plot = BooleanVar(value=True)
+        self.review = BooleanVar(value=True)  # OCR: ask user about problem frames
         self.status = StringVar(value="Select a video to begin.")
 
         self._build()
@@ -143,7 +150,8 @@ class RecoilGui:
         label("Shot detection")
         mframe = ttk.Frame(f)
         mframe.grid(row=row, column=1, columnspan=2, sticky="w")
-        ttk.Radiobutton(mframe, text="ammo counter", variable=self.method, value="ammo").pack(side="left")
+        ttk.Radiobutton(mframe, text="OCR ammo counter", variable=self.method, value="ocr").pack(side="left")
+        ttk.Radiobutton(mframe, text="dumb ammo counter", variable=self.method, value="ammo").pack(side="left", padx=8)
         ttk.Radiobutton(mframe, text="muzzle flash", variable=self.method, value="muzzle").pack(side="left", padx=8)
         row += 1
 
@@ -152,6 +160,7 @@ class RecoilGui:
         ttk.Checkbutton(opts, text="track black box (extra cross-check)", variable=self.track_box).pack(side="left")
         ttk.Checkbutton(opts, text="audio RPM", variable=self.use_audio).pack(side="left", padx=8)
         ttk.Checkbutton(opts, text="show plot", variable=self.show_plot).pack(side="left")
+        ttk.Checkbutton(opts, text="ask me about OCR issues", variable=self.review).pack(side="left", padx=8)
         row += 1
 
         label("Output folder")
@@ -199,7 +208,22 @@ class RecoilGui:
         if path:
             self.outdir.set(path)
 
+    def _alive(self) -> bool:
+        """True while the main window still exists.
+
+        Analysis runs on the UI thread and, with 'show plot' on, plt.show()
+        spins its own event loop; the user can close the main window during
+        either. Touching widgets afterwards raises a TclError, so callers guard
+        post-blocking widget access on this.
+        """
+        try:
+            return bool(self.root.winfo_exists())
+        except Exception:
+            return False
+
     def _set_status(self, text: str) -> None:
+        if not self._alive():
+            return
         self.status.set(text)
         self.root.update_idletasks()
 
@@ -208,6 +232,8 @@ class RecoilGui:
             self._do_run()
         except Exception as exc:  # surface any failure to the user
             traceback.print_exc()
+            if not self._alive():  # window already closed - nothing to report to
+                return
             messagebox.showerror("Recoil Analyser", f"{type(exc).__name__}: {exc}")
             self.run_btn.state(["!disabled"])
             self._set_status("Failed - see error dialog / console.")
@@ -221,6 +247,12 @@ class RecoilGui:
         magazine = int(self.magazine.get()) if self.magazine.get().strip().isdigit() else None
         method = self.method.get()
 
+        if method == "ocr":
+            missing = missing_ocr_dependencies()
+            if missing:
+                messagebox.showwarning("Recoil Analyser", ocr_dependency_error_message(missing))
+                return
+
         frame = first_frame(video)
         self._set_status("Draw a box around the WALL TAG in the popup (instructions shown there).")
         tag = select_roi_scaled(frame, "Select WALL TAG", instructions=ROI_HELP["tag"])
@@ -229,11 +261,11 @@ class RecoilGui:
             return
 
         ammo = muzzle = box = None
-        if method == "ammo":
+        if method in ("ammo", "ocr"):
             self._set_status("Draw a box around the AMMO COUNTER number in the popup.")
             ammo = select_roi_scaled(frame, "Select AMMO COUNTER", instructions=ROI_HELP["ammo"])
             if ammo is None:
-                self._set_status("Cancelled - ammo ROI required for ammo method.")
+                self._set_status("Cancelled - ammo ROI required for this method.")
                 return
         else:
             self._set_status("Draw a box around the MUZZLE / front-sight in the popup.")
@@ -260,6 +292,7 @@ class RecoilGui:
             distance_m=float(self.distance.get()),
             use_audio=self.use_audio.get(),
             progress=self._progress,
+            review=self._review_ocr if (method == "ocr" and self.review.get()) else None,
         )
 
         self.run_btn.state(["disabled"])
@@ -273,9 +306,31 @@ class RecoilGui:
         png = out_json.with_suffix(".png")
         save_plot(result, png, show=self.show_plot.get())
 
+        # show=True ran a blocking plot loop; the user may have closed the main
+        # window meanwhile. Bail before touching now-dead widgets (TclError).
+        if not self._alive():
+            return
+
         self.run_btn.state(["!disabled"])
         d = result.data
         rpm = d["rpm"]
+        ocr = d.get("ocr")
+        ocr_lines = ""
+        if ocr:
+            ocr_lines = (
+                f"OCR score min/mean: {ocr['min_score']} / {ocr['mean_score']} "
+                f"({ocr['frames_read']}/{ocr['frames_total']} frames read)\n"
+            )
+            if ocr["shots_match_magazine"] is False:
+                ocr_lines += (
+                    f"WARNING: {d['shots_detected']} shots != magazine {d['magazine']} "
+                    "- check the ammo ROI / magazine.\n"
+                )
+            if ocr["over_magazine_rejected"]:
+                ocr_lines += (
+                    f"WARNING: {ocr['over_magazine_rejected']} frame(s) read above the "
+                    "magazine and were discarded.\n"
+                )
         summary = (
             f"Shots detected: {d['shots_detected']} (magazine {d['magazine']})\n"
             f"RPM (video span): {rpm['video_span']}\n"
@@ -283,11 +338,109 @@ class RecoilGui:
             f"RPM (mech. max):  {rpm['mechanical_max']}\n"
             f"RPM (audio):      {rpm['audio']}\n"
             f"Tracking confidence min/mean: "
-            f"{d['tracking']['min_confidence']:.3f} / {d['tracking']['mean_confidence']:.3f}\n\n"
+            f"{d['tracking']['min_confidence']:.3f} / {d['tracking']['mean_confidence']:.3f}\n"
+            f"{ocr_lines}\n"
             f"JSON: {out_json}\nPlot: {png}"
         )
         self._set_status(f"Done. {d['shots_detected']} shots, RPM~{rpm['video_span']}.")
+        if result.ocr_series is not None:
+            self._show_ocr_window(result, d["magazine"])
         messagebox.showinfo("Recoil Analyser - done", summary)
+
+    def _show_ocr_window(self, result, magazine) -> None:
+        """Pop a scrollable window listing what the OCR read at each frame."""
+        from .ocr import transcript_lines
+
+        lines = transcript_lines(result.ocr_series, result.shot_frames, magazine)
+        bg, fg, field = "#1e1e1e", "#e0e0e0", "#2d2d2d"
+        win = Toplevel(self.root)
+        win.title("OCR readings per frame")
+        win.configure(bg=bg)
+        frame = ttk.Frame(win, padding=8)
+        frame.pack(fill="both", expand=True)
+        scroll = ttk.Scrollbar(frame, orient="vertical")
+        scroll.pack(side="right", fill="y")
+        text = Text(
+            frame, width=52, height=28, bg=field, fg=fg, insertbackground=fg,
+            relief="flat", font=("Consolas", 10), yscrollcommand=scroll.set,
+        )
+        text.pack(side="left", fill="both", expand=True)
+        scroll.config(command=text.yview)
+        header = (
+            f"{result.data['shots_detected']} shots detected "
+            f"(magazine {magazine}).\nOnly frames where the reading changed are shown.\n"
+            + "-" * 48 + "\n"
+        )
+        text.insert("1.0", header + "\n".join(lines))
+        text.config(state="disabled")  # read-only
+
+    def _review_ocr(self, problems, crops, readings, texts) -> dict:
+        """Modal: show each flagged crop and let the user confirm/correct it.
+
+        Returns {frame_index: corrected_count_or_None}. Runs on the UI thread
+        (analysis is synchronous here), so ``wait_window`` blocks until Done.
+        """
+        import base64
+
+        import cv2
+
+        from .ocr import parse_reading
+
+        bg, fg, field = "#1e1e1e", "#e0e0e0", "#2d2d2d"
+        mag = int(self.magazine.get()) if self.magazine.get().strip().isdigit() else None
+
+        win = Toplevel(self.root)
+        win.title("Confirm OCR readings")
+        win.configure(bg=bg)
+        win.transient(self.root)
+        win.grab_set()
+        ttk.Label(
+            win, style="Hint.TLabel", wraplength=540,
+            text=(f"{len(problems)} frame(s) need confirming. Type the CURRENT "
+                  "ammo number you see in each crop; leave blank if unreadable."),
+        ).pack(padx=10, pady=(10, 6))
+
+        container = ttk.Frame(win)
+        container.pack(fill="both", expand=True, padx=8)
+        canvas = Canvas(container, bg=bg, highlightthickness=0, width=560, height=430)
+        sb = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
+        inner = ttk.Frame(canvas)
+        inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=inner, anchor="nw")
+        canvas.configure(yscrollcommand=sb.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+
+        self._review_imgs = []  # keep PhotoImage refs alive
+        entries: dict[int, Entry] = {}
+        for f in problems:
+            row = ttk.Frame(inner)
+            row.pack(fill="x", pady=3, anchor="w")
+            disp = cv2.resize(crops[f], None, fx=3, fy=3, interpolation=cv2.INTER_NEAREST)
+            img = PhotoImage(data=base64.b64encode(cv2.imencode(".png", disp)[1].tobytes()))
+            self._review_imgs.append(img)
+            ttk.Label(row, image=img).pack(side="left", padx=4)
+            ttk.Label(row, style="Hint.TLabel", text=f"frame {f}\nOCR: {texts[f]!r}").pack(side="left", padx=6)
+            e = Entry(row, width=6, bg=field, fg=fg, insertbackground=fg, justify="center")
+            guess = parse_reading(texts[f], mag)
+            e.insert(0, "" if guess is None else str(guess))
+            e.pack(side="left", padx=6)
+            entries[f] = e
+
+        result: dict[int, int | None] = {}
+
+        def done() -> None:
+            # parse_reading is forgiving: "0", "0/30" and "30/30" all work;
+            # blank/garbage -> None (unreadable).
+            for fr, ent in entries.items():
+                result[fr] = parse_reading(ent.get(), None)
+            win.destroy()
+
+        ttk.Button(win, text="Done", command=done).pack(pady=8)
+        if entries:
+            next(iter(entries.values())).focus_set()
+        win.wait_window()
+        return result
 
     def _progress(self, done: int, total: int) -> None:
         if done % 15 == 0 or done == total:
